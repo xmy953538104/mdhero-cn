@@ -8,14 +8,6 @@ on:
         required: true
         default: main
         type: string
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/build-windows.yml
-      - README_CN.md
-  schedule:
-    # Monday 09:00, Asia/Shanghai (01:00 UTC).
-    - cron: '0 1 * * 1'
 
 permissions:
   contents: read
@@ -50,6 +42,12 @@ jobs:
           path: upstream
           persist-credentials: false
 
+      - name: Check out reviewed Chinese translation and CI files
+        uses: actions/checkout@v5
+        with:
+          path: cn
+          persist-credentials: false
+
       - name: Record source version and verify Windows x64 build tools
         run: |
           $sha = git rev-parse HEAD
@@ -78,6 +76,12 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: upstream/pnpm-lock.yaml
+
+      - name: Check upstream dictionaries and apply reviewed Chinese file
+        run: |
+          node ../cn/.github/scripts/sync-upstream-release.mjs --check-i18n .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item ../cn/src/lib/i18n/locales/zh-CN.json src/lib/i18n/locales/zh-CN.json -ErrorAction Stop
 
       - name: Set up Rust Stable
         uses: dtolnay/rust-toolchain@stable
@@ -129,7 +133,7 @@ jobs:
             'Build platform: Windows (windows-latest)'
             'Build architecture: x64 (x86_64-pc-windows-msvc)'
             'Windows code signing: No signing credentials supplied by this workflow.'
-            'Simplified Chinese: Unmodified official upstream translations.'
+            'Simplified Chinese: Reviewed zh-CN.json from the CI repository; based on official translations.'
           ) | Set-Content dist/BUILD-INFO.txt -Encoding utf8NoBOM
           $sums = foreach ($file in $installers | Sort-Object Name) {
             $copied = Join-Path dist $file.Name

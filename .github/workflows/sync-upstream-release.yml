@@ -1,0 +1,44 @@
+name: MDHero CN - Follow Upstream Releases
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Lightweight release query only; no Windows build without a new release.
+    - cron: '17 1 * * *'
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - .github/scripts/**
+      - .github/upstream-release.json
+      - README_CN.md
+      - src/lib/i18n/locales/zh-CN.json
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: mdhero-cn-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  follow-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Test release and translation guards
+        run: node --test .github/scripts/sync-upstream-release.test.mjs
+
+      - name: Check the latest official release and sync only when compatible
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/sync-upstream-release.mjs
