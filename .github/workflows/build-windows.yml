@@ -1,0 +1,166 @@
+name: MDHero CN - Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Official upstream branch, tag, or commit to build
+        required: true
+        default: main
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-windows.yml
+      - README_CN.md
+  schedule:
+    # Monday 09:00, Asia/Shanghai (01:00 UTC).
+    - cron: '0 1 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mdhero-cn-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: upstream
+    env:
+      UPSTREAM_REPOSITORY: vaibhav-kakde-in/mdhero
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+
+    steps:
+      - name: Check out official source directly
+        uses: actions/checkout@v5
+        with:
+          repository: vaibhav-kakde-in/mdhero
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Record source version and verify Windows x64 build tools
+        run: |
+          $sha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') { throw 'Cannot resolve upstream commit SHA.' }
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if (-not $config.version -or $config.version -ne $package.version) { throw 'Upstream package and Tauri versions are missing or inconsistent.' }
+          if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') { throw 'A Windows x64 runner is required.' }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $msvc = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $msvc) { throw 'The Windows MSVC build tools are missing.' }
+          "UPSTREAM_SHA=$sha" | Add-Content $env:GITHUB_ENV
+          "UPSTREAM_VERSION=$($config.version)" | Add-Content $env:GITHUB_ENV
+          Write-Output "Official source: $env:UPSTREAM_REPOSITORY @ $env:UPSTREAM_REF ($sha)"
+          Write-Output "Version: $($config.version); MSVC: $msvc"
+
+      - name: Set up pnpm 10
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+          package_json_file: upstream/package.json
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: upstream/pnpm-lock.yaml
+
+      - name: Set up Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream/src-tauri -> target
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Svelte and TypeScript
+        run: pnpm check
+
+      - name: Run upstream tests
+        run: pnpm test
+
+      - name: Build MSI and NSIS with the original Tauri configuration
+        run: pnpm tauri build
+
+      - name: Verify installers and collect delivery files
+        run: |
+          $msi = @(Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File -ErrorAction Stop)
+          $exe = @(Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File -ErrorAction Stop)
+          if ($msi.Count -eq 0) { throw 'The MSI installer is missing.' }
+          if ($exe.Count -eq 0) { throw 'The NSIS EXE installer is missing.' }
+          $installers = @($msi) + @($exe)
+          foreach ($file in $installers) {
+            if ($file.Length -lt 1MB -or $file.Name -notmatch 'x64') { throw "Invalid Windows x64 installer: $($file.Name) ($($file.Length) bytes)." }
+          }
+          New-Item -ItemType Directory -Path dist -ErrorAction Stop | Out-Null
+          $installers | Copy-Item -Destination dist
+          Copy-Item LICENSE dist/LICENSE -ErrorAction Stop
+          @(
+            'Project: mdhero-cn (community build of MDHero)'
+            "Upstream repository: https://github.com/$env:UPSTREAM_REPOSITORY"
+            "Upstream ref (branch/tag/commit): $env:UPSTREAM_REF"
+            "Upstream commit SHA: $env:UPSTREAM_SHA"
+            "Software version: $env:UPSTREAM_VERSION"
+            "CI repository: $env:GITHUB_REPOSITORY"
+            "CI run ID: $env:GITHUB_RUN_ID"
+            "CI run attempt: $env:GITHUB_RUN_ATTEMPT"
+            "CI run URL: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "Workflow commit SHA: $env:GITHUB_SHA"
+            "Build time (UTC): $([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            'Build platform: Windows (windows-latest)'
+            'Build architecture: x64 (x86_64-pc-windows-msvc)'
+            'Windows code signing: No signing credentials supplied by this workflow.'
+            'Simplified Chinese: Unmodified official upstream translations.'
+          ) | Set-Content dist/BUILD-INFO.txt -Encoding utf8NoBOM
+          $sums = foreach ($file in $installers | Sort-Object Name) {
+            $copied = Join-Path dist $file.Name
+            $hash = (Get-FileHash -LiteralPath $copied -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $sums | Set-Content dist/SHA256SUMS.txt -Encoding utf8NoBOM
+          foreach ($line in Get-Content dist/SHA256SUMS.txt) {
+            if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw 'Invalid SHA256SUMS.txt entry.' }
+            $expectedHash, $name = $Matches[1], $Matches[2]
+            if ((Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedHash) { throw "SHA256 verification failed: $name" }
+          }
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table
+          Get-Content dist/BUILD-INFO.txt, dist/SHA256SUMS.txt
+          @(
+            '## MDHero CN Windows x64'
+            "- Version: $env:UPSTREAM_VERSION"
+            "- Official ref: $env:UPSTREAM_REF"
+            "- Official commit: [$env:UPSTREAM_SHA](https://github.com/$env:UPSTREAM_REPOSITORY/commit/$env:UPSTREAM_SHA)"
+            '- Both MSI and NSIS EXE installers exist; SHA256 checks passed.'
+            '- Community build; no Windows code signing credentials supplied.'
+          ) | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload installers, license, build info and checksums
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdhero-cn-windows-x64
+          path: upstream/dist/*
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Record artifact download link
+        env:
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: |
+          if (-not $env:ARTIFACT_URL) { throw 'Artifact upload did not return a download URL.' }
+          "- [Download MSI, EXE, LICENSE, BUILD-INFO and SHA256SUMS]($env:ARTIFACT_URL) (retained for 90 days; GitHub login required)" | Add-Content $env:GITHUB_STEP_SUMMARY
